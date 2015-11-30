@@ -1,8 +1,10 @@
 -- zhangwei
--- The model that reads in desc, question and answer, and store them into three separate tables.
+-- The model that reads in desc, question and answer, and store them into
+-- three separate tables.
 -- The length of desc table is nlines times bigger than question or answer.
 
---Note that entity list is additional, and only for result dict, not for context dict.
+--Note that entity list is additional, and only for result dict, not for
+--  context dict.
 
 local Data = torch.class('Data')
 
@@ -25,19 +27,20 @@ end
 --- entites are both in vocab and e_vocab.
 -- e_ivocab contains inverted index of e_vocab.
 -- ivocab contains inverted index of entities, in vocab.
--- depend on where you use entity (in input or ouput), the index will be different.
+-- depend on where you use entity (in input or ouput), the index will be
+-- different.
 
 function Data:read(fname,train, is_full_vocab)
   local desc ={}
   local question = {}
   local answer = {}
   local temp_desc_str = {}
-  --  print ('creating dictionary from training data. Unigrams are mapped to unknown.')
+  --  print ('creating dictionary from training data. Unigrams are mapped to  unknown.')
   if train then
     for line in io.lines(fname) do
       local w = stringx.split(line)
       for i = 2,#w do
-        if not self.freq_vocab[w[i]] then self.freq_vocab[w[i]]=0 end   --- freq_vocab is used to store the frequencies of entities. Unigrams are mapped to unknown.
+        if not self.freq_vocab[w[i]] then self.freq_vocab[w[i]]=0 end   ---freq_vocab is used to store the frequencies of entities. Unigrams are mapped to unknown.
         self.freq_vocab[w[i]]=self.freq_vocab[w[i]]+1
       end
     end
@@ -62,7 +65,7 @@ function Data:read(fname,train, is_full_vocab)
             self.vocab[w[i]] = #self.vocab+1
             self.ivocab[#self.vocab] = w[i]
         end
-        --- note: the rest freq ==1 words are ignored, because <unk> is already in dic.
+        --- note: the rest freq ==1 words are ignored, because <unk> is  already in dic.
         end
       end
     end
@@ -92,12 +95,19 @@ function Data:get_entity_keys()
   end
 end
 
-function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
+local function get_count(table)
+  local count = 0
+  for _ in pairs(table) do count = count+1 end
+  return count
+end
 
+function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
+  --print(temp_desc_str)
   local maxSentLen = 0
   local document_size = #temp_desc_str-1
   for i=1,document_size do
-    if maxSentLen < #temp_desc_str[i]-1 then maxSentLen = #temp_desc_str[i]-1 end  --- exclude question mark
+    if maxSentLen < #temp_desc_str[i]-1 then maxSentLen = #temp_desc_str[i]-1
+  end  --- exclude question mark
   end
 
   local indmatrix = torch.zeros(document_size, maxSentLen)
@@ -107,15 +117,19 @@ function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
   local tempMap = tds.hash() -- to store maps of OOV-inV entites that are not in entity list
 
   if not train then
-    local entities = tds.hash() -- to store all the entities
+    
+    local entities = {} -- to store all the entities
+
     for i=1,#temp_desc_str do   --- loop over all sents, including question.
       local toks = temp_desc_str[i]
       for j = 2, #toks do
-        if string.find(toks[j],'@entity') then entities[toks[j]]=1 end   --- collect all the entities
+        if string.find(toks[j],'@entity') then entities[toks[j]]=1 end   ---collect all the entities
       end
     end
-    local mapped_eids = tds.hash()  -- This is to store the entities that are mapped to. And mapped-to entities should not be used again for other mapping entities.
-    if #entities~=0 then
+
+    local mapped_eids = tds.hash()  -- This is to store the entities that are  mapped to. And mapped-to entities should not be used again for other mapping entities.
+
+    if get_count(entities)~=0 then
       for k,v in pairs(entities) do
         local estr = self.e_vec[math.floor(torch.uniform(1,#self.e_vec+0.99))]
         local d = self.vocab[ estr ]
@@ -136,16 +150,16 @@ function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
       if train then -- if it's training, the words are guaranteed in dictionary.
         if self.vocab[w] then
           indmatrix[i][j-1] = self.vocab[w]
-      else                   -- if it's not in the vocabulary, meaning it's a rare word.
-        indmatrix[i][j-1] = self.unkidx
-      end
+        else                   -- if it's not in the vocabulary, meaning it's a  rare word.
+          indmatrix[i][j-1] = self.unkidx
+        end
       else   --- if it is validation data or test data
         if self.vocab[w] then
           indmatrix[i][j-1] = self.vocab[w]
-      elseif string.find(toks[j],'@entity') then    --- if it is an entity
-        indmatrix[i][j-1] = tempMap[w]
-      else
-        indmatrix[i][j-1] = self.unkidx
+        elseif string.find(toks[j],'@entity') then    --- if it is an entity
+	  indmatrix[i][j-1] = tempMap[w]
+        else
+          indmatrix[i][j-1] = self.unkidx
       end
       end
     end
@@ -160,19 +174,20 @@ function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
     if train then  -- in training, everything is in vocabulary. if not, it is unk.
       if self.vocab[w] then
         qt[i-1] = self.vocab[w]
-    else
-      qt[i-1] = self.unkidx
-    end
+      else
+        qt[i-1] = self.unkidx
+      end
     else  -- in test, words are not guaranteed to be in vocab.
       if self.vocab[w] then
         qt[i-1] = self.vocab[w]
-    elseif string.find(ql[i],'@entity') then   --- if entity not in vocab, generate a random entity in vocab.
-      qt[i-1] = tempMap[w]
-    else
-      qt[i-1] = self.unkidx
-    end
+      elseif string.find(ql[i],'@entity') then   --- if entity not in vocab, generate a random entity in vocab.
+        qt[i-1] = tempMap[w]
+      else
+        qt[i-1] = self.unkidx
+      end
     end
   end
+
   -----  answer -------
   local a4r=0
   local aw = ql[#ql-1]
@@ -185,6 +200,7 @@ function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
       a4r= self.e_vocab[ self.ivocab[tempMap[aw]] ]
     end
   end
+  
   if a4r == nil then
     print("Found a Nil answer! Skipped!")
     print(temp_desc_str)
@@ -206,7 +222,8 @@ function Data:permute_an_example(descs, questions, answers, index)
   local a = answers[index]
 
   local enids = tds.hash()
-  ------------------------------- get entities first --------------------------------------------
+  ------------------------------- get entities first
+  --------------------------------------------
   local m = d:size()
   for i = 1, m[1] do
     for j=1, m[2] do
@@ -226,26 +243,30 @@ function Data:permute_an_example(descs, questions, answers, index)
     end
   end
 
-  --------------------------------- permute ---------------------------------------------------
+  --------------------------------- permute
+                                    ---------------------------------------------------
   --permute entity list, using map
 
   local amap = tds.hash()
   local shuf_eids = tds.hash()
   for k,_ in pairs(enids) do
-    local d = self.vocab[ self.e_vec[math.floor(torch.uniform(1,#self.e_vec+0.99))] ]
+    local d = self.vocab[
+  self.e_vec[math.floor(torch.uniform(1,#self.e_vec+0.99))] ]
     while shuf_eids[d] do
-      d = self.vocab[ self.e_vec[math.floor(torch.uniform(1,#self.e_vec+0.99))] ]
+      d = self.vocab[
+  self.e_vec[math.floor(torch.uniform(1,#self.e_vec+0.99))] ]
     end
     amap[ k ] = d
     shuf_eids [d ] = 1
   end
 
-  ----------------------------------write back ------------------------------------------------
+  ----------------------------------write back
+                                    ------------------------------------------------
   local m = d:size()
   for i = 1, m[1] do
     for j=1, m[2] do
       if d[i][j] ~=0 then
-        if self.e_vocab[ self.ivocab[ d[i][j] ] ] then -- if the word is a entity, swap it.
+        if self.e_vocab[ self.ivocab[ d[i][j] ] ] then -- if the word is entity, swap it.
           d[i][j] = amap[ d[i][j] ];
         end
       end

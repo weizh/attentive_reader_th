@@ -1,301 +1,262 @@
---
-----  Copyright (c) 2014, Facebook, Inc.
-----  All rights reserved.
-----
-----  This source code is licensed under the Apache 2 license found in the
-----  LICENSE file in the root directory of this source tree. 
-----
-local ok,cunn = pcall(require, 'fbcunn')
-if not ok then
-    ok,cunn = pcall(require,'cunn')
-    if ok then
-        print("warning: fbcunn not found. Falling back to cunn") 
-        LookupTable = nn.LookupTable
-    else
---        print("Could not find cunn or fbcunn. Either is required")
---        os.exit()
-        print("Running in CPU mode.")
-    end
-else
-    deviceParams = cutorch.getDeviceProperties(1)
-    cudaComputeCapability = deviceParams.major + deviceParams.minor/10
-    LookupTable = nn.LookupTable
+--[[
+
+  Implementation of the Neural Turing Machine described here:
+
+  http://arxiv.org/pdf/1410.5401v2.pdf
+
+  Variable names take after the notation in the paper. Identifiers with "r"
+  appended indicate read-head variables, and likewise for those with "w" appended.
+
+  The NTM take a configuration table at initialization time with the following
+  options:
+
+  * input_dim   dimension of input vectors (required)
+  * output_dim  dimension of output vectors (required)
+  * mem_rows    number of rows of memory
+  * mem_cols    number of columns of memory
+  * cont_dim    dimension of controller state
+  * cont_layers number of controller layers
+  * shift_range allowed range for shifting read/write weights
+  * write_heads number of write heads
+  * read_heads  number of read heads
+
+--]]
+
+local LSTM, parent = torch.class('LSTM', 'nn.Module')
+
+
+function LSTM:__init(config)
+  self.input_dim   = config.input_dim   or error('config.input_dim must be specified')
+  self.output_dim  = config.output_dim  or error('config.output_dim must be specified')
+  self.cont_dim    = config.cont_dim    or 100
+  self.cont_layers = config.cont_layers or 1
+  self.dropout = config.dropout or 0.5
+  self.depth = 0
+  self.cells = {}
+  
+  self.master_cell = self:new_cell()
+  
+  self.init_module = self:new_init_module()
+  self:init_grad_inputs()
+
 end
 
-require('nngraph')
-require('base')
---local ptb = require('data')
+function LSTM:init_grad_inputs()
 
--- Train 1 day and gives 82 perplexity.
-
-local params = {batch_size=20,
-                seq_length=35,
-                layers=2,
-                decay=1.15,
-                rnn_size=1500,
-                dropout=0.65,
-                init_weight=0.04,
-                lr=1,
-                vocab_size=10000,
-                max_epoch=14,
-                max_max_epoch=55,
-                max_grad_norm=10}
-
--- Trains 1h and gives test 115 perplexity.
---local params = {batch_size=20,
---                seq_length=20,
---                layers=2,
---                decay=2,
---                rnn_size=200,
---                dropout=0,
---                init_weight=0.1,
---                lr=1,
---                vocab_size=10000,
---                max_epoch=4,
---                max_max_epoch=13,
---                max_grad_norm=5}
-
-local function transfer_data(x)
-  return x:cuda()
-end
-
-local state_train, state_valid, state_test
-local model = {}
-local paramx, paramdx
-
-local function lstm(x, prev_c, prev_h)
-  -- Calculate all four gates in one go
-  local i2h = nn.Linear(params.rnn_size, 4*params.rnn_size)(x)
-  local h2h = nn.Linear(params.rnn_size, 4*params.rnn_size)(prev_h)
-  local gates = nn.CAddTable()({i2h, h2h})
-  
-  -- Reshape to (batch_size, n_gates, hid_size)
-  -- Then slize the n_gates dimension, i.e dimension 2
-  local reshaped_gates =  nn.Reshape(4,params.rnn_size)(gates)
-  local sliced_gates = nn.SplitTable(2)(reshaped_gates)
-  
-  -- Use select gate to fetch each gate and apply nonlinearity
-  local in_gate          = nn.Sigmoid()(nn.SelectTable(1)(sliced_gates))
-  local in_transform     = nn.Tanh()(nn.SelectTable(2)(sliced_gates))
-  local forget_gate      = nn.Sigmoid()(nn.SelectTable(3)(sliced_gates))
-  local out_gate         = nn.Sigmoid()(nn.SelectTable(4)(sliced_gates))
-
-  local next_c           = nn.CAddTable()({
-      nn.CMulTable()({forget_gate, prev_c}),
-      nn.CMulTable()({in_gate,     in_transform})
-  })
-  local next_h           = nn.CMulTable()({out_gate, nn.Tanh()(next_c)})
-
-  return next_c, next_h
-end
-
-local function create_network()
-  local x                = nn.Identity()()
---  local y                = nn.Identity()()
-  local prev_s           = nn.Identity()()
-  local i                = {[0] = LookupTable(params.vocab_size,
-                                                    params.rnn_size)(x)}
-  local next_s           = {}
-  local split         = {prev_s:split(2 * params.layers)}
-  for layer_idx = 1, params.layers do
-    local prev_c         = split[2 * layer_idx - 1]
-    local prev_h         = split[2 * layer_idx]
-    local dropped        = nn.Dropout(params.dropout)(i[layer_idx - 1]) --- This is to add dropout layer between lstm layers.
-    local next_c, next_h = lstm(dropped, prev_c, prev_h)
-    table.insert(next_s, next_c)
-    table.insert(next_s, next_h)
-    i[layer_idx] = next_h
-  end
-  local h2y              = nn.Linear(params.rnn_size, params.vocab_size)
-  local dropped          = nn.Dropout(params.dropout)(i[params.layers])
-  local pred             = nn.LogSoftMax()(h2y(dropped))
---  local err              = nn.ClassNLLCriterion()({pred, y})
---  local module           = nn.gModule({x, y, prev_s},
---                                      {err, nn.Identity()(next_s)})
-
-  local module           = nn.gModule({x,prev_s},{pred,nn.Identity()(next_s)})
-  
-  module:getParameters():uniform(-params.init_weight, params.init_weight)
-  if ok then 
-    return transfer_data(module)
+  local m_gradInput, c_gradInput
+  if self.cont_layers == 1 then
+    m_gradInput = torch.zeros(self.cont_dim)
+    c_gradInput = torch.zeros(self.cont_dim)
   else
-    return module
-  end
-end
-
-local function setup()
-  print("Creating a RNN LSTM network.")
-  local core_network = create_network()
-  paramx, paramdx = core_network:getParameters()
-  model.s = {}
-  model.ds = {}
-  model.start_s = {}
-  for j = 0, params.seq_length do
-    model.s[j] = {}
-    for d = 1, 2 * params.layers do
-      model.s[j][d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
+    m_gradInput, c_gradInput = {}, {}
+    for i = 1, self.cont_layers do
+      m_gradInput[i] = torch.zeros(self.cont_dim)
+      c_gradInput[i] = torch.zeros(self.cont_dim)
     end
   end
-  for d = 1, 2 * params.layers do
-    model.start_s[d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
-    model.ds[d] = transfer_data(torch.zeros(params.batch_size, params.rnn_size))
-  end
-  model.core_network = core_network
-  model.rnns = g_cloneManyTimes(core_network, params.seq_length)
-  model.norm_dw = 0
-  model.err = transfer_data(torch.zeros(params.seq_length))
-  model.pred = transfer_data(torch.zeros(params.seq_length))
+
+  self.gradInput = {
+    torch.zeros(self.input_dim), -- input
+    m_gradInput,
+    c_gradInput
+  }
+  
 end
 
-local function reset_state(state)
-  state.pos = 1
-  if model ~= nil and model.start_s ~= nil then
-    for d = 1, 2 * params.layers do
-      model.start_s[d]:zero()
-    end
-  end
-end
-
-local function reset_ds()
-  for d = 1, #model.ds do
-    model.ds[d]:zero()
-  end
-end
-
---- forward propagation. returns the predictions, and loss function is applied outside the function.
-local function fp(state)
-  g_replace_table(model.s[0], model.start_s)
-  if state.pos + params.seq_length > state.data:size(1) then
-    reset_state(state)
-  end
-  for i = 1, params.seq_length do
-    local x = state.data[state.pos]
---    local y = state.data[state.pos + 1]
-    local s = model.s[i - 1]
---    model.err[i], model.s[i] = unpack(model.rnns[i]:forward({x, y, s}))
-    model.pred[i], model.s[i] = unpack(model.rnns[i]:forward({x, s}))
-    state.pos = state.pos + 1
-  end
-  g_replace_table(model.start_s, model.s[params.seq_length])
---  return model.err:mean()
-  return model.pred
-end
-
---- added second argument 'pred' as in the output of forward function.
-local function bp(state , dpred)
-  paramdx:zero()
-  reset_ds()
-  for i = params.seq_length, 1, -1 do
-    state.pos = state.pos - 1
-    local x = state.data[state.pos]
---    local y = state.data[state.pos + 1]
-    local s = model.s[i - 1]
---    local derr = transfer_data(torch.ones(1))
---    local tmp = model.rnns[i]:backward({x,y, s},
---                                       {pred, model.ds})[3]
-    local gradInput = model.rnns[i]:backward({x, s},
-                                       {dpred, model.ds})[2]
-    g_replace_table(model.ds, gradInput)
-    cutorch.synchronize()
-  end
-  state.pos = state.pos + params.seq_length
-  model.norm_dw = paramdx:norm()
-  if model.norm_dw > params.max_grad_norm then
-    local shrink_factor = params.max_grad_norm / model.norm_dw
-    paramdx:mul(shrink_factor)
-  end
-  paramx:add(paramdx:mul(-params.lr))
-end
-
-
-local function run_valid()
-  reset_state(state_valid)
-  g_disable_dropout(model.rnns)
-  local len = (state_valid.data:size(1) - 1) / (params.seq_length)
-  local perp = 0
-  for i = 1, len do
-    perp = perp + fp(state_valid)
-  end
-  print("Validation set perplexity : " .. g_f3(torch.exp(perp / len)))
-  g_enable_dropout(model.rnns)
-end
-
-local function run_test()
-  reset_state(state_test)
-  g_disable_dropout(model.rnns)
-  local perp = 0
-  local len = state_test.data:size(1)
-  g_replace_table(model.s[0], model.start_s)
-  for i = 1, (len - 1) do
-    local x = state_test.data[i]
-    local y = state_test.data[i + 1]
-    perp_tmp, model.s[1] = unpack(model.rnns[1]:forward({x, y, model.s[0]}))
-    perp = perp + perp_tmp[1]
-    g_replace_table(model.s[0], model.s[1])
-  end
-  print("Test set perplexity : " .. g_f3(torch.exp(perp / (len - 1))))
-  g_enable_dropout(model.rnns)
-end
-
-
-
-local function main()
-  g_init_gpu(arg)
-  state_train = {data=transfer_data(ptb.traindataset(params.batch_size))}
-  state_valid =  {data=transfer_data(ptb.validdataset(params.batch_size))}
-  state_test =  {data=transfer_data(ptb.testdataset(params.batch_size))}
-  print("Network parameters:")
-  print(params)
-  local states = {state_train, state_valid, state_test}   
-  for _, state in pairs(states) do   --- _ is the index in the table, and states is the content.
-    reset_state(state)
-  end
-  setup()
-  local step = 0
-  local epoch = 0
-  local total_cases = 0
-  local beginning_time = torch.tic()
-  local start_time = torch.tic()
-  print("Starting training.")
-  local words_per_step = params.seq_length * params.batch_size
-  local epoch_size = torch.floor(state_train.data:size(1) / params.seq_length)
---  local perps
-  while epoch < params.max_max_epoch do
---    local perp = fp(state_train)
-    pred = fp(state_train)
-    local perp = nn.NLLCriterion(pred,)
-    if perps == nil then
-      perps = torch.zeros(epoch_size):add(perp)
-    end
-    perps[step % epoch_size + 1] = perp
-    step = step + 1
+-- The initialization module initializes the state of NTM memory,
+-- read/write weights, and the state of the LSTM controller.
+function LSTM:new_init_module()
+  local dummy = nn.Identity()() -- always zero
+  local output_init = nn.Tanh()(nn.Linear(1, self.input_dim)(dummy))
     
-    bp(state_train)
-    total_cases = total_cases + params.seq_length * params.batch_size
-    epoch = step / epoch_size
-    if step % torch.round(epoch_size / 10) == 10 then
-      local wps = torch.floor(total_cases / torch.toc(start_time))
-      local since_beginning = g_d(torch.toc(beginning_time) / 60)
-      print('epoch = ' .. g_f3(epoch) ..
-            ', train perp. = ' .. g_f3(torch.exp(perps:mean())) ..
-            ', wps = ' .. wps ..
-            ', dw:norm() = ' .. g_f3(model.norm_dw) ..
-            ', lr = ' ..  g_f3(params.lr) ..
-            ', since beginning = ' .. since_beginning .. ' mins.')
+  -- controller state
+  local m_init, c_init = {}, {}
+  for i = 1, self.cont_layers do
+    m_init[i] = nn.Tanh()(nn.Linear(1, self.cont_dim)(dummy))
+    c_init[i] = nn.Tanh()(nn.Linear(1, self.cont_dim)(dummy))
+  end
+
+  -- wrap tables as nngraph nodes
+  m_init = nn.Identity()(m_init)
+  c_init = nn.Identity()(c_init)
+
+  local inits = {
+    output_init, m_init, c_init
+  }
+  return nn.gModule({dummy}, inits)
+end
+
+-- Create a new NTM cell. Each cell shares the parameters of the "master" cell
+-- and stores the outputs of each iteration of forward propagation.
+function LSTM:new_cell()
+  -- input to the network
+  local input = nn.Identity()()
+
+  -- LSTM controller output
+  local mtable_p = nn.Identity()()
+  local ctable_p = nn.Identity()()
+
+  -- output and hidden states of the controller module
+  local mtable, ctable = self:new_controller_module(input, mtable_p, ctable_p)
+  local m = (self.cont_layers == 1) and mtable 
+    or nn.SelectTable(self.cont_layers)(mtable)
+  local output = self:new_output_module(m)
+
+  local inputs = {input, mtable_p, ctable_p}
+  local outputs = {output, mtable, ctable}
+
+  local cell = nn.gModule(inputs, outputs)
+  if self.master_cell ~= nil then
+    share_params(cell, self.master_cell, 'weight', 'bias', 'gradWeight', 'gradBias')
+  end  
+  return cell
+end
+
+-- Create a new LSTM controller
+function LSTM:new_controller_module(input, mtable_p, ctable_p)
+  -- multilayer LSTM
+  local mtable, ctable = {}, {}
+  for layer = 1, self.cont_layers do
+    local new_gate, m_p, c_p
+    if self.cont_layers == 1 then
+      m_p = mtable_p
+      c_p = ctable_p
+    else
+      m_p = nn.SelectTable(layer)(mtable_p)
+      c_p = nn.SelectTable(layer)(ctable_p)
     end
-    if step % epoch_size == 0 then
-      run_valid()
-      if epoch > params.max_epoch then
-          params.lr = params.lr / params.decay
+
+    if layer == 1 then
+      new_gate = function()
+        local in_modules = {
+----------------------- apply dropout? -----------------------------------------------------------------------
+          nn.Dropout(self.dropout)(nn.Linear(self.input_dim, self.cont_dim)(input)),
+          nn.Linear(self.cont_dim, self.cont_dim)(m_p)
+        }
+        return nn.CAddTable()(in_modules)
+      end
+    else
+      new_gate = function()
+        return nn.CAddTable(){
+          nn.Linear(self.cont_dim, self.cont_dim)(mtable[layer - 1]),
+          nn.Linear(self.cont_dim, self.cont_dim)(m_p)
+        }
       end
     end
-    if step % 33 == 0 then
-      cutorch.synchronize()
-      collectgarbage()
-    end
+
+    -- input, forget, and output gates
+    local i = nn.Sigmoid()(new_gate())
+    local f = nn.Sigmoid()(new_gate())
+    local o = nn.Sigmoid()(new_gate())
+    local update = nn.Tanh()(new_gate())
+
+    -- update the state of the LSTM cell
+    ctable[layer] = nn.CAddTable(){
+      nn.CMulTable(){f, c_p},
+      nn.CMulTable(){i, update}
+    }
+
+    mtable[layer] = nn.CMulTable(){o, nn.Tanh()(ctable[layer])}
   end
-  run_test()
-  print("Training is over.")
+
+  mtable = nn.Identity()(mtable)
+  ctable = nn.Identity()(ctable)
+  return mtable, ctable
 end
 
-main()
+-----------------------------------------------------------------------------------------------------------------------------------------------------
+-- Create an output module, e.g. to output binary strings.
+function LSTM:new_output_module(m)
+-- return nn.LogSoftMax()(nn.Sigmoid()(nn.Linear(self.cont_dim, self.output_dim)(m)))
+--   return nn.Sigmoid()(nn.Dropout(self.dropout)(nn.Linear(self.cont_dim, self.output_dim)(m)))
+  return m
+end
+
+-- Forward propagate one time step. The outputs of previous time steps are 
+-- cached for backpropagation.
+function LSTM:forward(input)
+  self.depth = self.depth + 1
+  local cell = self.cells[self.depth]
+  if cell == nil then
+    cell = self:new_cell()
+    self.cells[self.depth] = cell
+  end
+  
+  local prev_outputs
+  if self.depth == 1 then
+    prev_outputs = self.init_module:forward(torch.Tensor{0})
+  else
+    prev_outputs = self.cells[self.depth - 1].output
+  end
+
+  -- get inputs
+  local inputs = {input}
+  for i = 2, #prev_outputs do
+    inputs[i] = prev_outputs[i]
+  end
+  local outputs = cell:forward(inputs)
+  self.output = outputs[1]
+  return self.output
+end
+
+-- Backward propagate one time step. Throws an error if called more times than
+-- forward has been called.
+function LSTM:backward(input, grad_output)
+  if self.depth == 0 then
+    error("No cells to backpropagate through")
+  end
+  local cell = self.cells[self.depth]
+  local grad_outputs = {grad_output}
+  for i = 2, #self.gradInput do
+    grad_outputs[i] = self.gradInput[i]
+  end
+
+  -- get inputs
+  local prev_outputs
+  if self.depth == 1 then
+    prev_outputs = self.init_module:forward(torch.Tensor{0})
+  else
+    prev_outputs = self.cells[self.depth - 1].output     -------------------------------------
+  end
+  local inputs = {input}
+  for i = 2, #prev_outputs do
+    inputs[i] = prev_outputs[i]
+  end
+
+  self.gradInput = cell:backward(inputs, grad_outputs)
+  self.depth = self.depth - 1
+  if self.depth == 0 then
+    self.init_module:backward(torch.Tensor{0}, self.gradInput)
+    for i = 1, #self.gradInput do
+      local gradInput = self.gradInput[i]
+      if type(gradInput) == 'table' then
+        for _, t in pairs(gradInput) do t:zero() end
+      else
+        self.gradInput[i]:zero()
+      end
+    end
+  end
+  return self.gradInput
+end
+
+
+function LSTM:parameters()
+  local p, g = self.master_cell:parameters()
+  local pi, gi = self.init_module:parameters()
+  tablex.insertvalues(p, pi)
+  tablex.insertvalues(g, gi)
+  return p, g
+end
+
+function LSTM:forget()
+  self.depth = 0
+  self:zeroGradParameters()
+  for i = 1, #self.gradInput do
+    self.gradInput[i]:zero()
+  end
+end
+
+function LSTM:zeroGradParameters()
+  self.master_cell:zeroGradParameters()
+  self.init_module:zeroGradParameters()
+end
