@@ -43,8 +43,18 @@ end
 
 function ATTN:new_attention()
   
+  local y_d = self:fbconcat_desc(dfout, dbout)
+  local u   = self:htconcat_question(qfout, qbout)
+  
 end
 
+--- dfout is forward output from lstm, and dbout is backward output.
+function ATTN:fbconcat_desc(dfout, dbout)
+  local dbout2 =dbout
+  for i=1,dbout:size(1) do
+    
+  end
+end
 function LSTM:init_grad_inputs()
 
   local m_gradInput, c_gradInput

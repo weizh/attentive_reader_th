@@ -126,8 +126,7 @@ function encode_q(lstm, question,flag)
 end
 
 function attend(attn, dfout,dbout,qfout,qbout)
-  local y_d = fbconcat_desc(dfout, dbout)
-  local u   = htconcat_question(qfout, qbout)
+
   return attn:forward(y_d,u)
 end
 
