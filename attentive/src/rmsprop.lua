@@ -6,7 +6,7 @@ Reference: http://arxiv.org/pdf/1308.0850v5.pdf, Sec 4.2
 
 --]]
 
-function ntm.rmsprop(opfunc, x, config, state)
+function rmsprop(opfunc, x, config, state)
   if config == nil and state == nil then
     error('no state provided')
   end

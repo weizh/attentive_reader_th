@@ -6,6 +6,7 @@ require('nngraph')
 include('rmsprop.lua')
 include('nn/LinearNoBias.lua')
 include('nn/RowReverse.lua')
+include('nn/myMixtureTable.lua')
 include('attn.lua')
 
 function share_params(cell, src, ...)

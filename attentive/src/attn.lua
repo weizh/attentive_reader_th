@@ -125,7 +125,7 @@ function ATTN:new_fcell()
   local mtable, ctable = self:new_lstm_module(input, mtable_p, ctable_p)
   local m = (self.cont_layers == 1) and mtable
     or nn.SelectTable(self.cont_layers)(mtable)
-  local output = m
+  local output = nn.Identity()(m)  --TODO: add complicated output function
 
   local inputs = {input, mtable_p, ctable_p}
   local outputs = {output, mtable, ctable}
@@ -151,7 +151,7 @@ function ATTN:new_bcell()
   local mtable, ctable = self:new_lstm_module(input, mtable_p, ctable_p)
   local m = (self.cont_layers == 1) and mtable
     or nn.SelectTable(self.cont_layers)(mtable)
-  local output = m
+  local output = nn.Identity()(m) -- TODO: add complicated output function
 
   local inputs = {input, mtable_p, ctable_p}
   local outputs = {output, mtable, ctable}
@@ -222,13 +222,13 @@ function ATTN:new_encode_transform_cell(qsize)
   --doc
   local fwd_d = nn.Identity()()
   local bwd_d = nn.Identity()()
-  local  yd = nn.JoinTable(2,2):forward({fwd_d,bwd_d})
+  local  yd = nn.JoinTable(2,2){fwd_d,bwd_d}
   --question
   local fwd_q = nn.Identity()()
   local bwd_q = nn.Identity()()
   local fwdSelect=nn.SelectTable(qsize)(nn.SplitTable(1)(fwd_q))
   local bwdSelect=nn.SelectTable(qsize)(nn.SplitTable(1)(bwd_q))
-  local u = nn.JoinTable(1)
+  local u = nn.JoinTable(1){fwdSelect,bwdSelect}
 
   return nn.gModule({fwd_d,bwd_d,fwd_q,bwd_q},{yd,u})
 end
@@ -253,19 +253,24 @@ function ATTN:new_ydt2stprime_cell()
 end
 -- single
 function ATTN:new_st2output_cell()
-  local sts = nn.Identity()() --- aggregated st outputs
+  local stprime = nn.Identity()() --- aggregated st outputs
   local yd = nn.Identity()()
   local u = nn.Identity()()
-  local sts_softmax = nn.SoftMax()(sts)
-  local r = nn.MixtureTable(){sts_sfmx, yd}
+  local sts_softmax = nn.SoftMax()(stprime)
+  local vsts_softmax = nn.View()(sts_softmax)
+  local r = nn.myMixtureTable(){vsts_softmax, yd}
   local gar = nn.Tanh()( nn.CAddTable(){nn.Linear(2*self.cont_dim,self.g_dim)(r), nn.Linear(2*self.cont_dim ,self.g_dim)(u)} )
   local padq = nn.LogSoftMax()(nn.Linear(self.g_dim,self.output_dim)(gar))
-  local ins = {yd,u,sts}
+
+  local ins = {yd,u,stprime}
   local outs = {padq}
   return nn.gModule(ins,outs)
 end
+
 -- alignment between question and each token in document
 function ATTN:attend(yd,u)
+  --  print(yd:size())
+  --  print(u:size())
   local ydLen = yd:size(1)
   self.stprimes = torch.zeros(ydLen)
   for i=1, ydLen do
@@ -274,21 +279,31 @@ function ATTN:attend(yd,u)
     end
     self.stprimes[i] = self.ydt2stprime_cells[i]:forward({yd[i],u})
   end
+  --  print(self.stprimes:size())
   local output = self.st2output_cell:forward({yd,u,self.stprimes})
   return output
 end
+
 function ATTN:detend(yd,u,gradOutput)
   local ydLen = yd:size(1)
-  local gyd = torch.Tensor():resizeAs(yd)
-  local gu  = torch.Tensor():resizeAs(u)
-  local gyd1,gu1,gstprimes = unpack( self.st2output_cell:backward({yd,u,self.stprimes},gradOutput) )
+  local gyd = torch.zeros(yd:size()):fill(0)
+  local gu  = torch.zeros(u:size()):fill(0)
+  print('--------------------In detend:--------------------')
+  local gyd1,gu1,gstprimes = unpack( self.st2output_cell:backward({yd,u,self.stprimes}, gradOutput ) )
+  print('gyd from output module') print(gyd1:mean() )
+  print('gu from output module') print(gu1:mean() )
+
   for i=ydLen,1,-1 do
-    local gydt, gu_ = self.ydt2stprime_cells[i]:backward({yd[i],u},gstprimes[i])
+    local gydt, gu_ = unpack ( self.ydt2stprime_cells[i]:backward({yd[i],u},torch.Tensor{gstprimes[i]})  )
     gyd[i] = gydt
     gu:add(gu_)
   end
+  print('gyd from accumulated alignment') print(gyd:mean())
+  print('gu after accumulated alignment') print(gu:mean())
+
   gyd:add(gyd1)
   gu:add(gu1)
+  
   return gyd, gu
 end
 ---------------------------------- cells ends -------------------------------------------------------
@@ -333,30 +348,35 @@ end
 -- gbwd = gradient of output.
 function ATTN:decode(input,grad,isdoc,isfwd)
   local cells = nil
-  if isfwd then 
+  if isfwd then
     if isdoc then cells = self.dfcells else cells = self.qfcells end
-  else 
+  else
     if isdoc then cells = self.dbcells else cells = self.qbcells end
   end
+
   if isfwd then self:init_lstm_grad_inputs() else self:init_blstm_grad_inputs() end-- set self.gradInput to zero start.
+
+  local the_gradInput = nil
+  if isfwd then the_gradInput = self.gradInput else the_gradInput = self.bgradInput end
+
   local initmodel = function()
-    if isfwd then return self.init_lstm_module else return self.init_blstm_module end
+    if isfwd then return self.init_lstm_cell else return self.init_blstm_cell end
   end
   local size = input:size(1)
   for k = size, 1, -1 do
     -- get gradients
     local cell = cells[k]
     local grad_outputs
-    ---   LSTM looks like input ->[c,m]-> output. 
-    --   input's gradInput discarded. 
+    ---   LSTM looks like input ->[c,m]-> output.
+    --   input's gradInput discarded.
     --   output's gradInput only have final state grad to bp thru.
     if k==size then
-      if isdoc then grad_outputs = {grad[k]}  else grad_outputs = {grad} end 
+      if isdoc then grad_outputs = {grad[k]}  else grad_outputs = {grad[k]} end
     else
-      if isdoc then grad_outputs = {grad[k]}  else grad_outputs = {torch.zeros(self.input_dim)} end --TODO: confirm
+      if isdoc then grad_outputs = {grad[k]}  else grad_outputs = {grad[k]} end --TODO: confirm
     end
-    for i = 2, #self.gradInput do
-      grad_outputs[i] = self.gradInput[i]
+    for i = 2, #the_gradInput do
+      grad_outputs[i] = the_gradInput[i]
     end
     -- get inputs
     local prev_outputs
@@ -370,10 +390,10 @@ function ATTN:decode(input,grad,isdoc,isfwd)
       inputs[i] = prev_outputs[i]
     end
     --bp
-    self.gradInput = cell:backward(inputs, grad_outputs)
+    the_gradInput = cell:backward(inputs, grad_outputs)
 
     if k == 1 then
-      initmodel():backward(torch.Tensor{0}, self.gradInput)
+      initmodel():backward(torch.Tensor{0}, the_gradInput)
     end
   end
 end
@@ -391,12 +411,20 @@ function ATTN:forward(input)
   self.bwd_q = self:encode(nn.RowReverse():forward(input[2]),false,false)
   self.encode_transform_cell = self:new_encode_transform_cell(self.qsize) --transform_cell does not have parameters.
   self.yd, self.u = unpack( self.encode_transform_cell:forward({self.fwd_d,self.bwd_d,self.fwd_q,self.bwd_q}) )
+  --  print('yd size is') print(self.yd:size())
+  print('Forward:  self.yd and self.u is ' .. self.yd:mean() .. ' ' .. self.u:mean())
   self.output = self:attend(self.yd,self.u)
   return self.output
 end
 function ATTN:backward(input, grad_output)
-  local gyd,gu =  self.detend(self.yd,self.u,grad_output)
+
+  print('grad for attention is ' .. grad_output:mean())
+  local gyd,gu =  self:detend(self.yd,self.u,grad_output)
+  print('grad for transform_cell is') print('gyd ' ) print( gyd:mean() ) print(' gu ') print( gu:mean() )
   local gfwd_d, gbwd_d,gfwd_q,gbwd_q = unpack( self.encode_transform_cell:backward({self.fwd_d,self.bwd_d,self.fwd_q,self.bwd_q}, {gyd,gu}) )
+  print('grad for encoders: ')
+  print('gfwd_d ') print(gfwd_d:mean())print('gbwd_d ') print(gbwd_d:mean())
+  print('gfwd_q') print(gfwd_q:mean()) print('gbwd_q') print(gbwd_q:mean())
   self:decode(nn.RowReverse():forward(input[2]), gbwd_q,false,false)
   self:decode(input[2],gfwd_q,false,true)
   self:decode(nn.RowReverse():forward(input[1]), gbwd_d,true,false)
@@ -411,7 +439,7 @@ function ATTN:parameters()
   local p3,g3 = self.master_bcell:parameters()
   local p4,g4 = self.master_ydt2stprime_cell:parameters()
   local p5,g5 = self.st2output_cell:parameters()
-  
+
   tablex.insertvalues(p, p1)
   tablex.insertvalues(g, g1)
   tablex.insertvalues(p, p2)

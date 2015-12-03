@@ -16,12 +16,13 @@ require('Data')
 torch.setdefaulttensortype('torch.FloatTensor')
 
 local cmd = torch.CmdLine()
-cmd:option('--cont_dim', 32, '')
+cmd:option('--cont_dim', 256, '')
 cmd:option('--cont_layers', 1, '')
-cmd:option('--m_dim',32,'')
-cmd:option('--g_dim',32,'')
+cmd:option('--m_dim',256,'')
+cmd:option('--g_dim',256,'')
 cmd:option('--train','','must specify train file path')
 cmd:option('--valid', '', 'must specify validation file path')
+cmd:option('--dropout',0.2,'')
 cmd:option('--testonly',false,'')
 cmd:option('--loadmodel','none','')
 cmd:option('--full_vocab_output',false,'')
@@ -103,11 +104,17 @@ function forward_backward(model, desc, question, answer, print_flag)
     question_matrix[i][question[i]]=1
   end
 
+  print(' --------------------------- Running Forward ------------------------------ ')
   -- present targets
   local output = model:forward({desc_matrix, question_matrix}) -- output is n hot encoding of dictionary size.
+  print('output mean is ') print(output:mean())
+  
+  print(' --------------------------- Running Backward ------------------------------ ')  
   local  loss = criteria:forward(output, answer)
-
-  model:backward({desc_matrix,question_matrx},loss)
+  
+  print('loss is') print(loss)
+  local criout= criteria:backward(output,answer)
+  model:backward( {desc_matrix,question_matrix} , criout )
 
   return output, loss
 end
@@ -170,7 +177,7 @@ end
 --
 --
 local attn = nn.ATTN(config)
-local params, grads = ntmmodel:getParameters()
+local params, grads = attn:getParameters()
 
 local num_iters = 1E10
 local start = sys.clock()
@@ -183,15 +190,19 @@ print(string.rep('=', 80))
 print('num params: ' .. params:size(1))
 
 local rmsprop_state = {
-  learningRate = 1e-4,
+  learningRate = 5e-5,
   momentum = 0.9,
   decay = 0.95
 }
 
+ local adagrad_state = {
+   learningRate = 1e-3
+ }
+
 if g_params.testonly then
   if g_params.loadmodel ~= 'none' then
     params:copy(torch.load(g_params.loadmodel))
-    evaluate(ntmmodel, tdesc,tq,ta)
+    evaluate(attn, tdesc,tq,ta)
   else
     error("should load model")
   end
@@ -199,22 +210,25 @@ else
   ------------------------------- train and test -------------------------------------------
   -- train
   for iter = 1, num_iters do
+  
+--    if iter >4 then break end
     local eval_flag = iter % eval_interval ==0
 
     local feval = function(x)
-      print(string.rep('-', 80))
+      print(string.rep('-', 200))
       print('iter = ' .. iter)
       print('learn rate = ' .. rmsprop_state.learningRate)
       print('momentum = ' .. rmsprop_state.momentum)
       print('decay = ' .. rmsprop_state.decay)
-      printf('t = %.1fs\n', sys.clock() - start)
+--      print('learn rate = ' .. adagrad_state.learningRate)
+      print('t = ' ..  (sys.clock() - start) )
 
       local loss = 0
       grads:zero()
 
       local dt ,qt, at = generate_example(data,desc,q,a)
       --   print("generated example")
-      local output, loss = forward_backward(ntmmodel, dt, qt, at, false)
+      local output, loss = forward_backward(attn, dt, qt, at, false)
       --   print("forward done")
       --   print("backward done")
 
@@ -226,11 +240,11 @@ else
       return loss, grads
     end
 
-    --optim.adagrad(feval, params, adagrad_state)
-    ntm.rmsprop(feval, params, rmsprop_state)
+--    optim.adagrad(feval, params, adagrad_state)
+    rmsprop(feval, params, rmsprop_state)
 
     if eval_flag then
-      evaluate(ntmmodel, tdesc,tq,ta)
+      evaluate(attn, tdesc,tq,ta)
     end
     --  collectgarbage()
   end
