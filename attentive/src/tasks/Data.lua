@@ -21,7 +21,10 @@ function Data:__init()
   self.e_vec = tds.vec()
   self.vocab['<unk>']=1
   self.ivocab[1] ='<unk>'
-  self.unkidx = self.vocab['<unk>']
+  self.e_vocab['<unk>']=1
+  self.e_ivocab[1]='<unk>'
+  self.unkidx = 1
+  self.is_full_vocab = true
 end
 
 --- entites are both in vocab and e_vocab.
@@ -31,6 +34,7 @@ end
 -- different.
 
 function Data:read(fname,train, is_full_vocab)
+  self.is_full_vocab = is_full_vocab
   local desc ={}
   local question = {}
   local answer = {}
@@ -58,13 +62,13 @@ function Data:read(fname,train, is_full_vocab)
           if not self.e_vocab[w[i]] then
             self.e_vocab[w[i]]= #self.e_vocab + 1
             self.e_ivocab[#self.e_vocab]=w[i]
-        end
+          end
         end
         if self.e_vocab[w[i]] or self.freq_vocab[w[i]] >1 then   --- Second pass, if word is an entity, add it to dict if not in dict.
           if not self.vocab[w[i]] then
             self.vocab[w[i]] = #self.vocab+1
             self.ivocab[#self.vocab] = w[i]
-        end
+          end
         --- note: the rest freq ==1 words are ignored, because <unk> is  already in dic.
         end
       end
@@ -72,14 +76,14 @@ function Data:read(fname,train, is_full_vocab)
 
     if num==1 then-- if it is the first line, which is in turn not a question line
       if #temp_desc_str ~= 0 then -- handle previously collected description instances.
-        self:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
+        self:process(temp_desc_str,desc,question,answer,train)
     end
     temp_desc_str = {}
     end
     table.insert(temp_desc_str,w) -- add the line anyways
   end
   -- handle the last missing example
-  self:process (temp_desc_str,desc,question,answer,train,is_full_vocab)
+  self:process (temp_desc_str,desc,question,answer,train)
 
   if train then
     -- get the entity vector as auxilary data structure for future use
@@ -95,30 +99,24 @@ function Data:get_entity_keys()
   end
 end
 
-local function get_count(table)
-  local count = 0
-  for _ in pairs(table) do count = count+1 end
-  return count
-end
-
-function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
+function Data:process(temp_desc_str,desc,question,answer,train)
   --print(temp_desc_str)
   local maxSentLen = 0
   local document_size = #temp_desc_str-1
   for i=1,document_size do
     if maxSentLen < #temp_desc_str[i]-1 then maxSentLen = #temp_desc_str[i]-1
-  end  --- exclude question mark
+    end  --- exclude question mark
   end
 
   local indmatrix = torch.zeros(document_size, maxSentLen)
 
   ----------------- if it is validation set -------------------------------
 
-  local tempMap = tds.hash() -- to store maps of OOV-inV entites that are not in entity list
+  local tempMap = tds.hash() -- to store maps ORIGINAL-MAPPED entities in validation or test set. NOTE: All entitites in ORIGINAL, no matter if it is OOEV or not, are mapped.
 
   if not train then
     
-    local entities = {} -- to store all the entities
+    local entities = tds.hash() -- to store all the entities
 
     for i=1,#temp_desc_str do   --- loop over all sents, including question.
       local toks = temp_desc_str[i]
@@ -127,9 +125,9 @@ function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
       end
     end
 
-    local mapped_eids = tds.hash()  -- This is to store the entities that are  mapped to. And mapped-to entities should not be used again for other mapping entities.
+    local mapped_eids = tds.hash()  -- This is to store the entities that are  mapped to. And mapped-to entities should not be used again for other mapping entities. NOTE: IDs are vocab ids, NOT e_vocab ids.
 
-    if get_count(entities)~=0 then
+    if #entities~=0 then
       for k,v in pairs(entities) do
         local estr = self.e_vec[math.floor(torch.uniform(1,#self.e_vec+0.99))]
         local d = self.vocab[ estr ]
@@ -154,10 +152,10 @@ function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
           indmatrix[i][j-1] = self.unkidx
         end
       else   --- if it is validation data or test data
-        if self.vocab[w] then
-          indmatrix[i][j-1] = self.vocab[w]
-        elseif string.find(toks[j],'@entity') then    --- if it is an entity
+        if string.find(toks[j],'@entity') then    --- if it is an entity
 	  indmatrix[i][j-1] = tempMap[w]
+        elseif self.vocab[w] then
+          indmatrix[i][j-1] = self.vocab[w]
         else
           indmatrix[i][j-1] = self.unkidx
       end
@@ -178,10 +176,10 @@ function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
         qt[i-1] = self.unkidx
       end
     else  -- in test, words are not guaranteed to be in vocab.
-      if self.vocab[w] then
-        qt[i-1] = self.vocab[w]
-      elseif string.find(ql[i],'@entity') then   --- if entity not in vocab, generate a random entity in vocab.
+      if string.find(ql[i],'@entity') then   --- if entity not in vocab, generate a random entity in vocab.
         qt[i-1] = tempMap[w]
+      elseif self.vocab[w] then
+        qt[i-1] = self.vocab[w]
       else
         qt[i-1] = self.unkidx
       end
@@ -189,16 +187,23 @@ function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
   end
 
   -----  answer -------
-  local a4r=0
+  local a4r
   local aw = ql[#ql-1]
-  if train then
-    a4r = self.e_vocab[aw]
-  else
-    if self.e_vocab[aw] then  -- if answer is in entity vocabulary
-      a4r = self.e_vocab[aw]
-    elseif tempMap[aw] then -- find the entity id in e_vocab, by using tempMap[aw]
-      a4r= self.e_vocab[ self.ivocab[tempMap[aw]] ]
-    end
+  if train then --- if it's in train mode
+	if not self.vocab[aw] then
+		return
+ 	end
+	if self.is_full_vocab then
+	    a4r = self.vocab[aw]
+        else
+            a4r = self.e_vocab[aw]
+        end
+  else  --- if it's in validation or test mode
+	if self.is_full_vocab then
+		a4r = tempMap[aw] --- The entity should have been mapped to another entity id already.
+	else
+ 	        a4r= self.e_vocab[ self.ivocab[tempMap[aw]] ]
+   	end
   end
   
   if a4r == nil then
@@ -207,11 +212,7 @@ function Data:process(temp_desc_str,desc,question,answer,train,is_full_vocab)
   else
     table.insert(desc, indmatrix)
     table.insert(question, qt)
-    if is_full_vocab then
-      table.insert(answer,a4r)
-    else
-      table.insert(answer,self.e_vocab[aw])
-    end
+    table.insert(answer,a4r)
   end
 end
 
@@ -281,16 +282,17 @@ function Data:permute_an_example(descs, questions, answers, index)
 
   --- the answer is guaranteed since the permutation is on training example. So find permuted output entity id by reverse lookup.
 
-  if not is_full_vocab then
+  if not self.is_full_vocab then
     local ind = self.vocab[ self.e_ivocab[a] ]
     local mapped_ind = amap[ind]
     local mapped_str = self.ivocab[ mapped_ind ]
     a = self.e_vocab[mapped_str];
     answers[index] = a -- move answers since it's a table, a is not a reference.
+    return d,q,a
   else
     answers[index] = amap[a]
+    return d,q,amap[a]
   end
-  return d,q,a
 end
 
 function Data:getVocab()

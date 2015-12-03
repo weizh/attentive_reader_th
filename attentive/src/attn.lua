@@ -1,51 +1,53 @@
 --[[
 
-  Implementation of the Neural Turing Machine described here:
+  Implementation of the Attentive Reader described here:
 
-  http://arxiv.org/pdf/1410.5401v2.pdf
+  arxiv.org/pdf/1506.03340
 
-  Variable names take after the notation in the paper. Identifiers with "r"
-  appended indicate read-head variables, and likewise for those with "w" appended.
 
-  The NTM take a configuration table at initialization time with the following
-  options:
-
+Options:
   * input_dim   dimension of input vectors (required)
   * output_dim  dimension of output vectors (required)
-  * mem_rows    number of rows of memory
-  * mem_cols    number of columns of memory
   * cont_dim    dimension of controller state
   * cont_layers number of controller layers
   * shift_range allowed range for shifting read/write weights
   * write_heads number of write heads
   * read_heads  number of read heads
-
 --]]
 
-local attn, parent = torch.class('ATTN', 'nn.Module')
+local ATTN, parent = torch.class('nn.ATTN', 'nn.Module')
 
-
-function attn:__init(config)
-  self.input_dim   = config.input_dim   or error('config.input_dim must be specified')
+function ATTN:__init(config)
+  self.input_dim = config.input_dim or error('must have been assigned values. Recheck with rc-task.lua')
   self.output_dim  = config.output_dim  or error('config.output_dim must be specified')
-  self.cont_dim    = config.cont_dim    or 100
-  self.cont_layers = config.cont_layers or 1
-  self.dropout = config.dropout or 0.5
-  self.depth = 0
-  self.cells = {}
-  
-  self.master_cell = self:new_cell()
-  
-  self.init_module = self:new_init_module()
-  self:init_grad_inputs()
+  self.cont_dim    = config.cont_dim    or error('must have been assigned values. Recheck with rc-task.lua')
+  self.cont_layers = config.cont_layers or error('must have been assigned values. Recheck with rc-task.lua')
+  self.m_dim = config.m_dim or error('must have been assigned values. Recheck with rc-task.lua')
+  self.g_dim = config.g_dim or error('must have been assigned values. Recheck with rc-task.lua')  -- column size of W(a), or length of g(d,q)
+  self.dropout = config.dropout or error('must have been assigned values. Recheck with rc-task.lua')
+
+  -- lstm cells d and q don't share cells
+  self.dfcells = {}
+  self.dbcells = {}
+  self.qfcells = {}
+  self.qbcells = {}
+
+  -- d and q shares parameters
+  self.init_lstm_cell   = self:new_init_lstm_cell() --different weights.
+  self.init_blstm_cell  = self:new_init_lstm_cell()
+  self.master_fcell = self:new_fcell()
+  self.master_bcell = self:new_bcell()
+
+  ---attn
+  self.ydt2stprime_cells ={}  -- put tdt2stprime cells
+  self.master_ydt2stprime_cell = self:new_ydt2stprime_cell()  --recurse
+  self.st2output_cell   = self:new_st2output_cell()  --single
 
 end
 
-function ATTN:new_attention()
-  
-end
-
-function LSTM:init_grad_inputs()
+--- initializes self.gradInput.
+-- Need to be expanded further.XXXXXXXXXXXXXXXXXXXXXXXXX
+function ATTN:init_lstm_grad_inputs()
 
   local m_gradInput, c_gradInput
   if self.cont_layers == 1 then
@@ -64,15 +66,34 @@ function LSTM:init_grad_inputs()
     m_gradInput,
     c_gradInput
   }
-  
+end
+function ATTN:init_blstm_grad_inputs()
+
+  local m_gradInput, c_gradInput
+  if self.cont_layers == 1 then
+    m_gradInput = torch.zeros(self.cont_dim)
+    c_gradInput = torch.zeros(self.cont_dim)
+  else
+    m_gradInput, c_gradInput = {}, {}
+    for i = 1, self.cont_layers do
+      m_gradInput[i] = torch.zeros(self.cont_dim)
+      c_gradInput[i] = torch.zeros(self.cont_dim)
+    end
+  end
+
+  self.bgradInput = {
+    torch.zeros(self.input_dim), -- input
+    m_gradInput,
+    c_gradInput
+  }
 end
 
 -- The initialization module initializes the state of NTM memory,
 -- read/write weights, and the state of the LSTM controller.
-function LSTM:new_init_module()
+function ATTN:new_init_lstm_cell()
   local dummy = nn.Identity()() -- always zero
   local output_init = nn.Tanh()(nn.Linear(1, self.input_dim)(dummy))
-    
+
   -- controller state
   local m_init, c_init = {}, {}
   for i = 1, self.cont_layers do
@@ -90,9 +111,9 @@ function LSTM:new_init_module()
   return nn.gModule({dummy}, inits)
 end
 
--- Create a new NTM cell. Each cell shares the parameters of the "master" cell
+-- Create a new NTM forward cell. Each cell shares the parameters of the "master" cell
 -- and stores the outputs of each iteration of forward propagation.
-function LSTM:new_cell()
+function ATTN:new_fcell()
   -- input to the network
   local input = nn.Identity()()
 
@@ -101,23 +122,49 @@ function LSTM:new_cell()
   local ctable_p = nn.Identity()()
 
   -- output and hidden states of the controller module
-  local mtable, ctable = self:new_controller_module(input, mtable_p, ctable_p)
-  local m = (self.cont_layers == 1) and mtable 
+  local mtable, ctable = self:new_lstm_module(input, mtable_p, ctable_p)
+  local m = (self.cont_layers == 1) and mtable
     or nn.SelectTable(self.cont_layers)(mtable)
-  local output = self:new_output_module(m)
+  local output = m
 
   local inputs = {input, mtable_p, ctable_p}
   local outputs = {output, mtable, ctable}
 
   local cell = nn.gModule(inputs, outputs)
-  if self.master_cell ~= nil then
-    share_params(cell, self.master_cell, 'weight', 'bias', 'gradWeight', 'gradBias')
-  end  
+  if self.master_fcell ~= nil then
+    share_params(cell, self.master_fcell, 'weight', 'bias', 'gradWeight', 'gradBias')
+  end
   return cell
 end
 
--- Create a new LSTM controller
-function LSTM:new_controller_module(input, mtable_p, ctable_p)
+-- Create a new NTM backward cell. Each cell shares the parameters of the "master" cell
+-- and stores the outputs of each iteration of forward propagation.
+function ATTN:new_bcell()
+  -- input to the network
+  local input = nn.Identity()()
+
+  -- LSTM controller output
+  local mtable_p = nn.Identity()()
+  local ctable_p = nn.Identity()()
+
+  -- output and hidden states of the controller module
+  local mtable, ctable = self:new_lstm_module(input, mtable_p, ctable_p)
+  local m = (self.cont_layers == 1) and mtable
+    or nn.SelectTable(self.cont_layers)(mtable)
+  local output = m
+
+  local inputs = {input, mtable_p, ctable_p}
+  local outputs = {output, mtable, ctable}
+
+  local cell = nn.gModule(inputs, outputs)
+  if self.master_bcell ~= nil then
+    share_params(cell, self.master_bcell, 'weight', 'bias', 'gradWeight', 'gradBias')
+  end
+  return cell
+end
+
+function ATTN:new_lstm_module(input, mtable_p, ctable_p)
+
   -- multilayer LSTM
   local mtable, ctable = {}, {}
   for layer = 1, self.cont_layers do
@@ -133,7 +180,7 @@ function LSTM:new_controller_module(input, mtable_p, ctable_p)
     if layer == 1 then
       new_gate = function()
         local in_modules = {
------------------------ apply dropout? -----------------------------------------------------------------------
+          ----------------------- apply dropout? -----------------------------------------------------------------------
           nn.Dropout(self.dropout)(nn.Linear(self.input_dim, self.cont_dim)(input)),
           nn.Linear(self.cont_dim, self.cont_dim)(m_p)
         }
@@ -168,99 +215,221 @@ function LSTM:new_controller_module(input, mtable_p, ctable_p)
   return mtable, ctable
 end
 
------------------------------------------------------------------------------------------------------------------------------------------------------
--- Create an output module, e.g. to output binary strings.
-function LSTM:new_output_module(m)
--- return nn.LogSoftMax()(nn.Sigmoid()(nn.Linear(self.cont_dim, self.output_dim)(m)))
---   return nn.Sigmoid()(nn.Dropout(self.dropout)(nn.Linear(self.cont_dim, self.output_dim)(m)))
-  return m
+--- lstm output -> encoding
+-- doc: concat every state -- q: concat 1st and last state
+function ATTN:new_encode_transform_cell(qsize)
+
+  --doc
+  local fwd_d = nn.Identity()()
+  local bwd_d = nn.Identity()()
+  local  yd = nn.JoinTable(2,2):forward({fwd_d,bwd_d})
+  --question
+  local fwd_q = nn.Identity()()
+  local bwd_q = nn.Identity()()
+  local fwdSelect=nn.SelectTable(qsize)(nn.SplitTable(1)(fwd_q))
+  local bwdSelect=nn.SelectTable(qsize)(nn.SplitTable(1)(bwd_q))
+  local u = nn.JoinTable(1)
+
+  return nn.gModule({fwd_d,bwd_d,fwd_q,bwd_q},{yd,u})
 end
 
--- Forward propagate one time step. The outputs of previous time steps are 
--- cached for backpropagation.
-function LSTM:forward(input)
-  self.depth = self.depth + 1
-  local cell = self.cells[self.depth]
-  if cell == nil then
-    cell = self:new_cell()
-    self.cells[self.depth] = cell
-  end
-  
-  local prev_outputs
-  if self.depth == 1 then
-    prev_outputs = self.init_module:forward(torch.Tensor{0})
-  else
-    prev_outputs = self.cells[self.depth - 1].output
-  end
+---------------------------------------------  Attention --------------------------------------------------
 
-  -- get inputs
-  local inputs = {input}
-  for i = 2, #prev_outputs do
-    inputs[i] = prev_outputs[i]
+--recursive
+function ATTN:new_ydt2stprime_cell()
+  local ydt = nn.Identity()()
+  local u   = nn.Identity()()
+  local ydtemb = nn.Linear(2*self.cont_dim,self.m_dim)(ydt)
+  local uemb    = nn.Linear(2*self.cont_dim,self.m_dim)(u)
+  local mt = nn.Tanh()(nn.CAddTable(){ydtemb,uemb})
+  local stprime = nn.Linear(self.m_dim,1)(mt)
+  local ins = {ydt,u}
+  local outs = {stprime}
+  local cell = nn.gModule(ins,outs)
+  if self.master_attn_cell ~= nil then
+    share_params(cell, self.master_ydt2stprime_cell, 'weight', 'bias', 'gradWeight', 'gradBias')
   end
-  local outputs = cell:forward(inputs)
-  self.output = outputs[1]
-  return self.output
+  return cell
+end
+-- single
+function ATTN:new_st2output_cell()
+  local sts = nn.Identity()() --- aggregated st outputs
+  local yd = nn.Identity()()
+  local u = nn.Identity()()
+  local sts_softmax = nn.SoftMax()(sts)
+  local r = nn.MixtureTable(){sts_sfmx, yd}
+  local gar = nn.Tanh()( nn.CAddTable(){nn.Linear(2*self.cont_dim,self.g_dim)(r), nn.Linear(2*self.cont_dim ,self.g_dim)(u)} )
+  local padq = nn.LogSoftMax()(nn.Linear(self.g_dim,self.output_dim)(gar))
+  local ins = {yd,u,sts}
+  local outs = {padq}
+  return nn.gModule(ins,outs)
+end
+-- alignment between question and each token in document
+function ATTN:attend(yd,u)
+  local ydLen = yd:size(1)
+  self.stprimes = torch.zeros(ydLen)
+  for i=1, ydLen do
+    if self.ydt2stprime_cells[i] ==nil then
+      self.ydt2stprime_cells[i] = self:new_ydt2stprime_cell()
+    end
+    self.stprimes[i] = self.ydt2stprime_cells[i]:forward({yd[i],u})
+  end
+  local output = self.st2output_cell:forward({yd,u,self.stprimes})
+  return output
+end
+function ATTN:detend(yd,u,gradOutput)
+  local ydLen = yd:size(1)
+  local gyd = torch.Tensor():resizeAs(yd)
+  local gu  = torch.Tensor():resizeAs(u)
+  local gyd1,gu1,gstprimes = unpack( self.st2output_cell:backward({yd,u,self.stprimes},gradOutput) )
+  for i=ydLen,1,-1 do
+    local gydt, gu_ = self.ydt2stprime_cells[i]:backward({yd[i],u},gstprimes[i])
+    gyd[i] = gydt
+    gu:add(gu_)
+  end
+  gyd:add(gyd1)
+  gu:add(gu1)
+  return gyd, gu
+end
+---------------------------------- cells ends -------------------------------------------------------
+
+-- generate output from a chain of hidden states
+-- input: sentence (sentLen * tokenSize)
+-- output: (sentLen * self.cont_dim)
+function ATTN:encode(input, isdoc, isfwd)
+  local cells =nil
+  if isdoc then
+    if isfwd then cells = self.dfcells else cells = self.dbcells end
+  else
+    if isfwd then cells = self.qfcells else cells = self.qbcells end
+  end
+  local newcell = function()
+    if isfwd then return self:new_fcell() else return self:new_bcell() end
+  end
+  local init_cell = function()
+    if isfwd then return self.init_lstm_cell else return self.init_blstm_cell end
+  end
+  local size = input:size(1)
+  local fwdoutputs = torch.zeros(size,self.cont_dim)
+  local prev_out
+  for i = 1, size do
+    if cells[i] == nil then
+      cells[i] = newcell()
+    end
+    if i==1 then
+      prev_out = init_cell():forward(torch.Tensor{0})
+    else
+      prev_out = cells[i-1].output
+    end
+    local cur_in = {input[i]}
+    for i = 2, #prev_out do
+      cur_in[i] = prev_out[i]
+    end
+    fwdoutputs[i]:copy( cells[i]:forward(cur_in)[1])
+  end
+  return fwdoutputs
 end
 
--- Backward propagate one time step. Throws an error if called more times than
--- forward has been called.
-function LSTM:backward(input, grad_output)
-  if self.depth == 0 then
-    error("No cells to backpropagate through")
+-- gbwd = gradient of output.
+function ATTN:decode(input,grad,isdoc,isfwd)
+  local cells = nil
+  if isfwd then 
+    if isdoc then cells = self.dfcells else cells = self.qfcells end
+  else 
+    if isdoc then cells = self.dbcells else cells = self.qbcells end
   end
-  local cell = self.cells[self.depth]
-  local grad_outputs = {grad_output}
-  for i = 2, #self.gradInput do
-    grad_outputs[i] = self.gradInput[i]
+  if isfwd then self:init_lstm_grad_inputs() else self:init_blstm_grad_inputs() end-- set self.gradInput to zero start.
+  local initmodel = function()
+    if isfwd then return self.init_lstm_module else return self.init_blstm_module end
   end
+  local size = input:size(1)
+  for k = size, 1, -1 do
+    -- get gradients
+    local cell = cells[k]
+    local grad_outputs
+    ---   LSTM looks like input ->[c,m]-> output. 
+    --   input's gradInput discarded. 
+    --   output's gradInput only have final state grad to bp thru.
+    if k==size then
+      if isdoc then grad_outputs = {grad[k]}  else grad_outputs = {grad} end 
+    else
+      if isdoc then grad_outputs = {grad[k]}  else grad_outputs = {torch.zeros(self.input_dim)} end --TODO: confirm
+    end
+    for i = 2, #self.gradInput do
+      grad_outputs[i] = self.gradInput[i]
+    end
+    -- get inputs
+    local prev_outputs
+    if k == 1 then
+      prev_outputs = initmodel():forward(torch.Tensor{0})
+    else
+      prev_outputs = cells[k - 1].output
+    end
+    local inputs = {input[k]}
+    for i = 2, #prev_outputs do
+      inputs[i] = prev_outputs[i]
+    end
+    --bp
+    self.gradInput = cell:backward(inputs, grad_outputs)
 
-  -- get inputs
-  local prev_outputs
-  if self.depth == 1 then
-    prev_outputs = self.init_module:forward(torch.Tensor{0})
-  else
-    prev_outputs = self.cells[self.depth - 1].output     -------------------------------------
-  end
-  local inputs = {input}
-  for i = 2, #prev_outputs do
-    inputs[i] = prev_outputs[i]
-  end
-
-  self.gradInput = cell:backward(inputs, grad_outputs)
-  self.depth = self.depth - 1
-  if self.depth == 0 then
-    self.init_module:backward(torch.Tensor{0}, self.gradInput)
-    for i = 1, #self.gradInput do
-      local gradInput = self.gradInput[i]
-      if type(gradInput) == 'table' then
-        for _, t in pairs(gradInput) do t:zero() end
-      else
-        self.gradInput[i]:zero()
-      end
+    if k == 1 then
+      initmodel():backward(torch.Tensor{0}, self.gradInput)
     end
   end
-  return self.gradInput
+end
+--- Forward Backward Functions:
+-- input: {
+--            Document Tensor (SentenceLen x TokenSize)
+--            Question Tensor (QuestionLen x TokenSize)
+--         }
+function ATTN:forward(input)
+  self.dsize = input[1]:size(1)
+  self.qsize = input[2]:size(1)
+  self.fwd_d = self:encode(input[1],true,true)
+  self.bwd_d = self:encode( nn.RowReverse():forward(input[1]),true,false)
+  self.fwd_q = self:encode(input[2],false,true)
+  self.bwd_q = self:encode(nn.RowReverse():forward(input[2]),false,false)
+  self.encode_transform_cell = self:new_encode_transform_cell(self.qsize) --transform_cell does not have parameters.
+  self.yd, self.u = unpack( self.encode_transform_cell:forward({self.fwd_d,self.bwd_d,self.fwd_q,self.bwd_q}) )
+  self.output = self:attend(self.yd,self.u)
+  return self.output
+end
+function ATTN:backward(input, grad_output)
+  local gyd,gu =  self.detend(self.yd,self.u,grad_output)
+  local gfwd_d, gbwd_d,gfwd_q,gbwd_q = unpack( self.encode_transform_cell:backward({self.fwd_d,self.bwd_d,self.fwd_q,self.bwd_q}, {gyd,gu}) )
+  self:decode(nn.RowReverse():forward(input[2]), gbwd_q,false,false)
+  self:decode(input[2],gfwd_q,false,true)
+  self:decode(nn.RowReverse():forward(input[1]), gbwd_d,true,false)
+  self:decode(input[1],gfwd_d,true,true)
+  return self.gradInput -- dummy.
 end
 
-
-function LSTM:parameters()
-  local p, g = self.master_cell:parameters()
-  local pi, gi = self.init_module:parameters()
-  tablex.insertvalues(p, pi)
-  tablex.insertvalues(g, gi)
+function ATTN:parameters()
+  local p,g = self.init_lstm_cell:parameters()
+  local p1,g1 = self.init_blstm_cell:parameters()
+  local p2,g2 = self.master_fcell:parameters()
+  local p3,g3 = self.master_bcell:parameters()
+  local p4,g4 = self.master_ydt2stprime_cell:parameters()
+  local p5,g5 = self.st2output_cell:parameters()
+  
+  tablex.insertvalues(p, p1)
+  tablex.insertvalues(g, g1)
+  tablex.insertvalues(p, p2)
+  tablex.insertvalues(g, g2)
+  tablex.insertvalues(p, p3)
+  tablex.insertvalues(g, g3)
+  tablex.insertvalues(p, p4)
+  tablex.insertvalues(g, g4)
+  tablex.insertvalues(p, p5)
+  tablex.insertvalues(g, g5)
   return p, g
 end
 
-function LSTM:forget()
-  self.depth = 0
-  self:zeroGradParameters()
-  for i = 1, #self.gradInput do
-    self.gradInput[i]:zero()
-  end
-end
-
-function LSTM:zeroGradParameters()
-  self.master_cell:zeroGradParameters()
-  self.init_module:zeroGradParameters()
+function ATTN:zeroGradParameters()
+  self.init_lstm_cell:zeroGradParameters()
+  self.init_blstm_cell:zeroGradParameters()
+  self.master_fcell:zeroGradParameters()
+  self.master_bcell:zeroGradParameters()
+  self.master_ydt2stprime_cell:zeroGradParameters()
+  self.st2output_cell:zeroGradParameters()
 end

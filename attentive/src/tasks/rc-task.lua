@@ -1,6 +1,6 @@
 --[[
 
-  Training a NTM to memorize input.
+  Training attentive reader
 
   The current version seems to work, giving good output after 5000 iterations
   or so. Proper initialization of the read/write weights seems to be crucial
@@ -9,23 +9,26 @@
 --]]
 
 require('../init')
-require('./util')
 require('optim')
 require('sys')
 require('Data')
-require('../rmsprop')
+
 torch.setdefaulttensortype('torch.FloatTensor')
 
 local cmd = torch.CmdLine()
-cmd:option('--cont_dim', 100, '')
+cmd:option('--cont_dim', 32, '')
 cmd:option('--cont_layers', 1, '')
+cmd:option('--m_dim',32,'')
+cmd:option('--g_dim',32,'')
 cmd:option('--train','','must specify train file path')
 cmd:option('--valid', '', 'must specify validation file path')
 cmd:option('--testonly',false,'')
 cmd:option('--loadmodel','none','')
+cmd:option('--full_vocab_output',false,'')
 cmd:option('--eval_interval',30000,'')
-
 g_params = cmd:parse(arg or {})
+
+print(g_params)
 
 torch.manualSeed(0)
 math.randomseed(0)
@@ -34,187 +37,81 @@ math.randomseed(0)
 --
 --
 local data = Data()
-
 local desc, q, a = data:read(g_params.train,true,g_params.full_vocab_output)  --- not only reads data, but also forms dictionaries.
 local tdesc, tq, ta = data:read(g_params.valid,false,g_params.full_vocab_output)   --- use dictionaries from previous state to get validation data.
-
 collectgarbage()
-
 print( 'vocabulary size for training data is ' .. #data:getVocab())
 
 -- note: permutation of training set is done during training.
 -- Never permute test set!
 
---Attentive reader configuration
+local l_output_dim = #data:getEVocab()
+if g_params.full_vocab_output then l_output_dim = #data:getVocab()+2 end
+
 local config = {
-  input_dim = #data:getVocab()+2,
-  output_dim = l_output_dim,
-  cont_dim = g_params.cont_dim,
-  cont_layers =g_params.cont_layers,
+  input_dim   =   #data:getVocab()+1,
+  output_dim  =   l_output_dim,
+  cont_dim    =   g_params.cont_dim,
+  cont_layers =   g_params.cont_layers,
+  m_dim =  g_params.m_dim,
+  g_dim =  g_params.g_dim,
+  dropout = g_params.dropout
+
 }
 
+--------------------------------start program -----------------------------------------------------------
 function generate_example(data,desc,q,a)
   local ind = math.floor(torch.uniform(1, #desc+0.99))
   local nd,nq,na = data:permute_an_example(desc,q,a,ind)
   return nd,nq,na
+    --return desc[ind],q[ind],a[ind]
 end
 
---------------------------------start program -----------------------------------------------------------
---start_symbol = torch.zeros(config.input_dim)
---start_symbol[config.input_dim]=1
---query_symbol = torch.zeros(config.input_dim)
---query_symbol[config.input_dim-1]=1
---zero_symbol = torch.zeros(config.input_dim)
 
-function forward(flstm, blstm, attn, desc, question, answer, print_flag)
+local criteria = nn.ClassNLLCriterion()
 
-  local dsize = get_desc_size(desc)
-  local d_f_output = encode_d(flstm, desc, dsize,config.cont_dim,false)
-  local d_b_output = encode_d(blstm, desc, dsize,config.cont_dim,false)
+local desc_matrix = torch.Tensor()
+local question_matrix = torch.Tensor()
 
-  local q_f_output= encode_q(flstm, question, config.cont_dim,false)
-  local q_d_output = encode_q(blstm, question,config.cont_dim,false)
+function forward_backward(model, desc, question, answer, print_flag)
 
-  local logSoftMax   = attend(attn, d_f_output, d_b_output, q_f_output, q_d_output)
-
-  local criteria = nn.ClassNLLCritrerion()
-
-  local loss = criteria:forward(logSoftMax, answer)
-
-  return logSoftMax, loss, criteria
-end
-
-function get_desc_size(desc)
-  local size =0
+  -- wwww  <s> wwwwwwwww <s> wwwwwwwwwww <s>
+  local descLen = 0
   for i = 1, desc:size(1) do
     for j = 1, desc:size(2) do
       if desc[i][j]~=0 then
-        size = size+1
+        descLen = descLen+1
       end
     end
+    descLen = descLen+1
   end
-  return size
-end
-
--- Encoded ensures that no zero peddings between sentences are there.
-function encode_d( lstm, desc, size, rnnsize, flag)
-  local w = torch.zeros(config.input_dim)
-  local output=torch.DoubleTensor(size, rnnsize)
-  local index = 1
+  desc_matrix:resize(descLen,config.input_dim):zero()
+  local count = 0
   for i = 1, desc:size(1) do
     for j = 1, desc:size(2) do
       if desc[i][j]~=0 then
-        w[desc[i][j]]=1
-        outputs[index] = model:forward(w)
-        index = index+1
-        w[desc[i][j]]=0
+        count = count+1
+        desc_matrix[count][desc[i][j]] =1
       end
     end
+    count = count+1
+    desc_matrix[count][config.input_dim]=1
   end
-  return output
-end
 
-function encode_q(lstm, question,flag)
-  local w = torch.zeros(config.input_dim)
-  local output = torch.DoubleTensor(question:size(1))
+  question_matrix:resize(question:size(1),config.input_dim):zero()
   for i=1,question:size(1) do
-    w[question[i]]=1
-    output[i]=model:forward(w)
-    w[question[i]]=0
-  end
-  return output
-end
-
-function attend(attn, dfout,dbout,qfout,qbout)
-  local y_d = fbconcat_desc(dfout, dbout)
-  local u   = htconcat_question(qfout, qbout)
-  return attn:forward(y_d,u)
-end
-
---  local target = torch.zeros(config.output_dim)
---  -- present start symbol
---  model:forward(start_symbol)
---
---  -- present inputs
---
---
---  -- present targets
---  model:forward(query_symbol)
---  local output = model:forward(zero_symbol) -- output is n hot encoding of dictionary size.
---
---    criteria = nn.ClassNLLCriterion()
---
---  target[answer]=1
---  local loss
---    loss = criteria:forward(output, answer)
---  target[answer]=0
---
---  --  if print_flag then print_read_max(model) end
---
---  return output, loss, criteria
---end
-
-function attend(model, desc, question, answer, print_flag)
-  local d_f_output, d_f_loss, q_f_criteria = encode(f_lstm_model, dt, false)
-  local d_b_output, d_b_loss, q_b_criteria = encode(b_lstm_model, dt, false)
-
-  local q_f_output, q_f_loss, q_f_criteria = encode(f_lstm_model, qt, false)
-  local q_d_output, q_d_loss, q_d_criteria = encode(b_lstm_model, qt, false)
-
-  local y_d = fw_bw_concat
-
-  local atte
-  return output, loss, criteria
-end
-
-
-function backward(model, desc, question, answer, output,criteria, train)
-  local w = torch.zeros(config.input_dim)
-  local target = torch.zeros(config.output_dim)
-  local zeros = torch.zeros(config.output_dim)
-
-  --  print('backward readout symbol')
-  if train then
-    target[answer] = 1
-    if config.output_trans == 1 then
-      model:backward(zero_symbol, criteria:backward(output,target):mul(config.input_dim))
-    elseif config.output_trans == 0 then
-      model:backward(zero_symbol, criteria:backward(output,answer))
-    else
-      error('specify output transformation first. -- thrown in backward.')
-    end
-    target[answer]=0
-  else
-    model:backward(zero_symbol,zeros)
-  end
-  --  print('backward readout symbol')
-  model:backward(query_symbol,zeros)
-
-  --  print('backward question symbol')
-  for j = question:size(1),1, -1 do
-    w[question[j]]=1
-    model:backward(w,zeros)
-    w[question[j]]=0
+    question_matrix[i][question[i]]=1
   end
 
-  --  print('backward query symbol')
-  model:backward(query_symbol,zeros)
+  -- present targets
+  local output = model:forward({desc_matrix, question_matrix}) -- output is n hot encoding of dictionary size.
+  local  loss = criteria:forward(output, answer)
 
-  --  print('backward description symbol')
-  for i = desc:size(1), 1, -1 do
-    for j = desc:size(2),1,-1 do
-      if desc[i][j]~=0 then
-        w[desc[i][j]]=1
-        model:backward(w,zeros)
-        w[desc[i][j]]=0
-      end
-    end
-  end
+  model:backward({desc_matrix,question_matrx},loss)
 
-  --  print('backward start symbol')
-  model:backward(start_symbol, zeros)
-  --  print('backward model. NTM cell left: ' .. model:get_depth())
+  return output, loss
 end
+
 
 function evaluate(model,descs,questions,answers)
   local vocab = data:getVocab()
@@ -272,19 +169,15 @@ end
 --------------------------------------------- main starts here ------------------------------------------------------------------------------------------
 --
 --
-local f_lstm_model = LSTM(config)
-local b_lstm_model = lSTM(config)
-
-local attn_model = ATTN(config)
-
-local params, grads = attn_mmodel:getParameters()
+local attn = nn.ATTN(config)
+local params, grads = ntmmodel:getParameters()
 
 local num_iters = 1E10
 local start = sys.clock()
 local print_interval = 25
 local eval_interval = g_params.eval_interval
 print(string.rep('=', 80))
-print("NTM rc data task")
+print("Attentive reader rc data task")
 print('training up to ' .. num_iters .. ' iteration(s)')
 print(string.rep('=', 80))
 print('num params: ' .. params:size(1))
@@ -307,7 +200,6 @@ else
   -- train
   for iter = 1, num_iters do
     local eval_flag = iter % eval_interval ==0
-    local print_flag = iter% print_interval ==0
 
     local feval = function(x)
       print(string.rep('-', 80))
@@ -322,9 +214,8 @@ else
 
       local dt ,qt, at = generate_example(data,desc,q,a)
       --   print("generated example")
-      local output, loss, criteria = forward(f_lstm_model, b_lstm_model, attn_model, dt,qt,at,print_flag)
+      local output, loss = forward_backward(ntmmodel, dt, qt, at, false)
       --   print("forward done")
-      backward(f_lstm_model, b_lstm_model, attn_model, dt, qt, at, output,criteria, true)
       --   print("backward done")
 
       -- clip gradients
