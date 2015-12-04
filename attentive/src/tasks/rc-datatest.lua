@@ -2,9 +2,9 @@ require 'Data'
 
 local data = Data()
 
-local desc, q, a = data:read('/Users/weizhang/git/torch-ntm-latest/tasks/data/train-k4.txt',true,false)
+local desc, q, a = data:read('data/temp.txt',true,false)
 print('train done')
-local tdesc, tq, ta = data:read('/Users/weizhang/git/torch-ntm-latest/tasks/data/valid-k4.txt',false,false)
+local tdesc, tq, ta = data:read('data/temp.txt',false,false)
 print('valid done')
 print (#desc)
 print (#q)

@@ -1,9 +1,7 @@
 --[[
 
   Implementation of the Attentive Reader described here:
-
-  arxiv.org/pdf/1506.03340
-
+  
 
 Options:
   * input_dim   dimension of input vectors (required)
@@ -24,7 +22,7 @@ function ATTN:__init(config)
   self.cont_layers = config.cont_layers or error('must have been assigned values. Recheck with rc-task.lua')
   self.m_dim = config.m_dim or error('must have been assigned values. Recheck with rc-task.lua')
   self.g_dim = config.g_dim or error('must have been assigned values. Recheck with rc-task.lua')  -- column size of W(a), or length of g(d,q)
-  self.dropout = config.dropout or error('must have been assigned values. Recheck with rc-task.lua')
+  self.dropout_rate = config.dropout or error('must have been assigned values. Recheck with rc-task.lua')
 
   -- lstm cells d and q don't share cells
   self.dfcells = {}
@@ -111,7 +109,7 @@ function ATTN:new_init_lstm_cell()
   return nn.gModule({dummy}, inits)
 end
 
--- Create a new NTM forward cell. Each cell shares the parameters of the "master" cell
+-- Create a new lstm forward cell. Each cell shares the parameters of the "master" cell
 -- and stores the outputs of each iteration of forward propagation.
 function ATTN:new_fcell()
   -- input to the network
@@ -180,8 +178,7 @@ function ATTN:new_lstm_module(input, mtable_p, ctable_p)
     if layer == 1 then
       new_gate = function()
         local in_modules = {
-          ----------------------- apply dropout? -----------------------------------------------------------------------
-          nn.Dropout(self.dropout)(nn.Linear(self.input_dim, self.cont_dim)(input)),
+          nn.Dropout(self.dropout_rate)(nn.Linear(self.input_dim, self.cont_dim)(input)),
           nn.Linear(self.cont_dim, self.cont_dim)(m_p)
         }
         return nn.CAddTable()(in_modules)
@@ -260,7 +257,7 @@ function ATTN:new_st2output_cell()
   local vsts_softmax = nn.View()(sts_softmax)
   local r = nn.myMixtureTable(){vsts_softmax, yd}
   local gar = nn.Tanh()( nn.CAddTable(){nn.Linear(2*self.cont_dim,self.g_dim)(r), nn.Linear(2*self.cont_dim ,self.g_dim)(u)} )
-  local padq = nn.LogSoftMax()(nn.Linear(self.g_dim,self.output_dim)(gar))
+  local padq = nn.LogSoftMax()(nn.Dropout(self.dropout_rate)(nn.Linear(self.g_dim,self.output_dim)(gar)))
 
   local ins = {yd,u,stprime}
   local outs = {padq}
@@ -299,14 +296,14 @@ function ATTN:detend(yd,u,gradOutput)
     gu:add(gu_)
   end
   print('gyd from accumulated alignment') print(gyd:mean())
-  print('gu after accumulated alignment') print(gu:mean())
+  print('gu  from accumulated alignment') print(gu:mean())
 
   gyd:add(gyd1)
   gu:add(gu1)
   
   return gyd, gu
 end
----------------------------------- cells ends -------------------------------------------------------
+---------------------------------- cells end -------------------------------------------------------
 
 -- generate output from a chain of hidden states
 -- input: sentence (sentLen * tokenSize)
@@ -345,7 +342,7 @@ function ATTN:encode(input, isdoc, isfwd)
   return fwdoutputs
 end
 
--- gbwd = gradient of output.
+-- grad = gradient of output.
 function ATTN:decode(input,grad,isdoc,isfwd)
   local cells = nil
   if isfwd then
@@ -373,7 +370,7 @@ function ATTN:decode(input,grad,isdoc,isfwd)
     if k==size then
       if isdoc then grad_outputs = {grad[k]}  else grad_outputs = {grad[k]} end
     else
-      if isdoc then grad_outputs = {grad[k]}  else grad_outputs = {grad[k]} end --TODO: confirm
+      if isdoc then grad_outputs = {grad[k]}  else grad_outputs = {torch.zeros(self.cont_dim)} end --TODO: confirm or grad[k]?
     end
     for i = 2, #the_gradInput do
       grad_outputs[i] = the_gradInput[i]
