@@ -2,9 +2,7 @@
 
   Training attentive reader
 
-  The current version seems to work, giving good output after 5000 iterations
-  or so. Proper initialization of the read/write weights seems to be crucial
-  here.
+  http://arxiv.org/pdf/1506.03340.pdf
 
 --]]
 
@@ -16,17 +14,17 @@ require('Data')
 torch.setdefaulttensortype('torch.FloatTensor')
 
 local cmd = torch.CmdLine()
-cmd:option('--cont_dim', 256, '')
+cmd:option('--cont_dim', 32, '')
 cmd:option('--cont_layers', 1, '')
-cmd:option('--m_dim',256,'')
-cmd:option('--g_dim',256,'')
+cmd:option('--m_dim',32,'')
+cmd:option('--g_dim',32,'')
 cmd:option('--train','','must specify train file path')
 cmd:option('--valid', '', 'must specify validation file path')
 cmd:option('--dropout',0.2,'')
 cmd:option('--testonly',false,'')
 cmd:option('--loadmodel','none','')
 cmd:option('--full_vocab_output',false,'')
-cmd:option('--eval_interval',30000,'')
+cmd:option('--eval_interval',1000,'')
 g_params = cmd:parse(arg or {})
 
 print(g_params)
@@ -111,9 +109,9 @@ function forward_backward(model, desc, question, answer, print_flag)
   
   print(' --------------------------- Running Backward ------------------------------ ')  
   local  loss = criteria:forward(output, answer)
-  
-  print('loss is') print(loss)
   local criout= criteria:backward(output,answer)
+  print('loss is') print(loss)
+  
   model:backward( {desc_matrix,question_matrix} , criout )
 
   return output, loss
@@ -133,13 +131,13 @@ function evaluate(model,descs,questions,answers)
     --    for k,v in pairs(shortlist) do
     --        print (k .. ' ' .. v)
     --    end
-    local output,loss,criteria = forward(model,descs[i],questions[i],answers[i], false)
-    backward(model,descs[i],questions[i],answers[i],output, criteria, false)
+    local output,loss,criteria = forward_backward(model,descs[i],questions[i],answers[i], false)
     local p = output_argmax(output,shortlist)
     if p == answers[i] then correct = correct +1 end
     print (' answer is ' .. answers[i] .. ' , prediction is ' .. p)
+    print (' running accuracy is' .. (correct/i) )
   end
-  print('accuracy is ' .. (correct/#descs))
+  print('Final accuracy is ' .. (correct/#descs))
 end
 
 function get_entity_shortlist(desc,vocab)
