@@ -2,9 +2,9 @@ require 'Data'
 
 local data = Data()
 
-local desc, q, a = data:read('data/temp.txt',true,false)
+local desc, q, a = data:read('data/sample.txt',true,false)
 print('train done')
-local tdesc, tq, ta = data:read('data/temp.txt',false,false)
+local tdesc, tq, ta = data:read('data/sample.txt',false,false)
 print('valid done')
 print (#desc)
 print (#q)
