@@ -72,22 +72,19 @@ local question_matrix = torch.Tensor()
 function forward_backward(model, desc, question, answer, print_flag)
 
   -- wwww  <s> wwwwwwwww <s> wwwwwwwwwww <s>
-  local descLen = 0
-  for i = 1, #desc do
-    descLen = descLen+1
-  end
-  desc_matrix:resize(descLen,config.input_dim):zero()
-  local count = 0
-  for i = 1, #desc do
-    count = count+1
-    if desc[i]~=0 then
-      desc_matrix[count][desc[i]] =1
-    end
-  end
 
+  desc_matrix:resize(#desc,config.input_dim):zero()
+
+  local count = 0
+    for i,v in pairs(desc) do
+      count = count+1
+      if desc[i]~=0 then 
+	desc_matrix[count][v]=1 
+      end
+    end
   question_matrix:resize(#question,config.input_dim):zero()
-  for i=1,#question do
-    question_matrix[i][question[i]]=1
+  for i,v in pairs(question) do
+    question_matrix[i][v]=1
   end
 
 --  print(' --------------------------- Running Forward ------------------------------ ')

@@ -45,69 +45,63 @@ end
 function babi:readFile(fname,istrain, suponly)
   if istrain then
     self:gen_dict(fname)
-    print(self.desc_vocab)
-    print(self.q_vocab)
   end
   --  print(fname)
-  local tokens
   local tlines = {}
+  local parts
+  local tokens
   for line in io.lines(fname) do  --print(line)
-    tokens = stringx.split(line, ' ')
-    if tonumber(tokens[1]) ==1 and #tlines~=0 then -- a new instance
-      tlines = {tokens}  -- reset tlines
-    elseif string.find(tokens[#tokens],'\t') then
-      self:process(tlines,tokens,suponly)
+    parts = stringx.split(stringx.strip(line), '\t')
+    dtokens = stringx.split(stringx.strip(parts[1]))
+    if tonumber(dtokens[1]) ==1 then -- a new instance
+      tlines[tonumber(dtokens[1])]= dtokens  -- reset tlines
+    elseif #parts>1 then
+      self:process(tlines,dtokens,parts[2],parts[3],suponly) --parts[2] answer, 3 is fids.
     else
-      tlines[tonumber(tokens[1])] = tokens
+      tlines[tonumber(dtokens[1])] = dtokens
     end
   end
-  self:process(tlines,tokens,suponly) -- the missing training instance
+  self:process(tlines,dtokens,parts[2],parts[3],suponly) -- the missing training instance
   return self.desc, self.qs, self.ans
 end
 
-function babi:process(tlines,qs,suponly)--tlines is map. qs is list
-  if #qs ==0 then return end
+function babi:process(tdlines,tqline,ans,fid,suponly)--tlines is map. qs is list
   local desc = tds.vec()
   local question = tds.vec()
   local answer = tds.vec()
 
-  --  print(tlines) print(qs)
-  local answerparts = stringx.split(stringx.strip(qs[#qs]),'\t')
-  --  print(answerparts)
-  local ans= answerparts[1]
+  local fids = stringx.split(stringx.strip(fid),' ')
 
   if suponly then
-    local supids = stringx.split(answerparts[2],',')
-    --  print(supids)
     local start = 1
-    for _, supid in pairs(supids) do
+    for _, supid in pairs(fids) do
       if start ==1 then
         start = 0
       else
         desc:insert(0)
       end
-      local dline = tlines[tonumber(supid)]
+      local dline = tdlines[tonumber(supid)]
       for i=2, #dline do
         desc:insert(self.desc_vocab[dline[i]])
       end
     end
   else
     local start = 1
-    for _, words in pairs(tlines) do
+    for i, words in pairs(tdlines) do
       if start ==1 then
         start = 0
       else
         desc:insert(0)
       end
       for i=2, #words do
-        desc:insert( self.desc_vocab[words[i]] )
+	desc:insert( self.desc_vocab[words[i]] )
       end
     end
   end
 
-  for i=2, #qs-1 do
+  for i=2, #tqline do
     --    print(qs[i])
-    question:insert(self.desc_vocab[qs[i]])
+    question:insert(self.desc_vocab[tqline[i]])
   end
 
   answer:insert(self.q_vocab[ans])

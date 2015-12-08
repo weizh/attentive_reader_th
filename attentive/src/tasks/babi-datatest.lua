@@ -9,4 +9,4 @@ local dst, qst, ast = bb:readFile('data/qa1_test.txt',false,false)
 print(#ds .. ' ' .. #qs .. ' ' .. #as)
 print(#dst .. ' ' .. #qst .. ' ' .. #ast)
 
---print (ds)
+print (ds)
