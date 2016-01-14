@@ -206,7 +206,7 @@ function Data:process(temp_desc_str,desc,question,answer,train)
    	end
   end
   
-  if a4r == nil then
+  if a4r == nil or aw =='null' then
     print("Found a Nil answer! Skipped!")
     print(temp_desc_str)
   else
